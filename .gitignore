@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+ai/sugang.db
+ai/data/
