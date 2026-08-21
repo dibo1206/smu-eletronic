@@ -4,3 +4,4 @@ __pycache__/
 .env
 sugang.db
 data/
+.langgraph_api/

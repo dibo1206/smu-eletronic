@@ -5,6 +5,13 @@ rag-system의 src/ai/graph.py와 같은 역할 — state.py의 State와 nodes.py
 전부 nodes.py에 있고, 여기서는 "어떤 노드를 어떤 순서로 잇는지"만 다룬다.
 """
 
+import sys
+from pathlib import Path
+
+# langgraph dev/langgraph.json은 이 파일을 패키지 설치 없이 경로로 직접 불러오므로,
+# "ai.nodes" 같은 절대 임포트가 되도록 src/를 sys.path에 직접 넣어준다.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from langchain_core.messages import HumanMessage
 from langgraph.graph import END, START, StateGraph
 

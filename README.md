@@ -2,7 +2,8 @@
 
 상명대학교 전자공학과(천안) 학생을 위한 RAG · Text2SQL 기반 수강신청 챗봇입니다.
 과목/시간표/경쟁률처럼 데이터가 필요한 질문은 Text2SQL로, 수강신청 절차·졸업요건·교수님 정보처럼
-문서 설명이 필요한 질문은 RAG로 자동 라우팅해서 답합니다.
+문서 설명이 필요한 질문은 RAG로, 인사·잡담처럼 검색이 필요 없는 질문은 바로 답변으로
+자동 라우팅합니다.
 
 ## 아키텍처
 
@@ -10,20 +11,32 @@
 사용자 질문
    │
    ▼
-LangGraph 라우터 (src/ai/graph.py, src/ai/nodes.py)
-   │  질문 의도를 "document" / "data"로 분류 (with_structured_output)
+classify_query — "general" / "document" / "data"로 분류 (with_structured_output,
+                  temperature=0으로 고정해 같은 질문엔 항상 같은 결과)
+   │
+   ├─ general ──▶ 검색 없이 바로 답변 (인사·잡담·챗봇 소개)
    │
    ├─ document ─▶ RAG 엔진 (src/ai/retriever.py)
    │              메타데이터 필터로 카테고리 좁힌 뒤
    │              Parent Document Retriever로 Qdrant Cloud 검색
    │              → 근거 페이지 기반 답변 생성
-   │              (불충분하면 조건부 엣지로 data_fallback 노드 재시도)
+   │              │
+   │              ├─ 불충분하면 rewrite_document_query가 질문을 재작성해
+   │              │  document를 다시 시도 (최대 2회 재작성)
+   │              └─ 그래도 부족하면 data로 폴백
    │
    └─ data ─────▶ Text2SQL 엔진 (src/ai/text2sql.py)
                   LangChain SQLDatabase로 SQL 생성 → 검증 → 실행
                   → 실행 결과 기반 답변 생성
-                  (불충분하면 조건부 엣지로 document_fallback 노드 재시도)
+                  │
+                  ├─ 불충분하면 이전 SQL을 피드백 삼아 data 자신을 다시
+                  │  시도 (최대 2회 재시도)
+                  └─ 그래도 부족하면 document로 폴백
 ```
+
+각 경로는 먼저 같은 도메인 안에서 재시도해보고, 그래도 안 되면 반대
+도메인으로 한 번 더 시도한다 (rag-system 베이스라인의 `vector_search ↔
+rewrite_query` 루프, `database_query` 자기 재시도 루프와 같은 구조).
 
 ## 폴더 구조
 
@@ -44,10 +57,17 @@ rag-system(`src/ai/{state,nodes,graph}.py` 분리) 구조를 그대로 따르고
 | `scripts/merge_official_pdfs.py` | 학교 공식 PDF 5종을 하나로 병합 |
 | `datasets/` | RAG용 PDF 원본 (공식자료 통합본, 교수진 안내) |
 | `data/` | 생성된 CSV (gitignore 대상) |
+| `langgraph.json` | `langgraph dev`(LangGraph Studio)용 그래프 진입점 설정 |
 
 ## 데이터 출처
 
-- **강좌 정보**: 상명대학교 전자공학과(천안) 2026학년도 공식 교육과정 + 2026-2학기 실제 개설강좌 정보
+- **강좌 정보**: 학교 공식 문서(`datasets/2026-2학기_수강신청_공식자료_통합.pdf`,
+  "5. 2026-2학기 개설학과별 시간표" 중 "공과대학 전자공학과" 표)에 실제로 나오는
+  과목만 담았다. 전자공학과 커리큘럼 전체가 아니라, 2026-2학기에 개설된다고
+  공식 문서로 확인되는 12개 과목만 있다 — 담당교수를 임의로 지어내지 않기 위해서다.
+  수강 정원은 공식 문서에 없는 값이라 실제 수강신청 화면 기준으로 조사해둔 값을 썼고,
+  수강신청현황(신청 인원)은 경쟁률 데모용으로 생성한 통계값이다(특정인의 신원과
+  무관하므로 실제 데이터가 없어도 문제되지 않는다).
 - **안내 문서**: 학교에서 제공한 2026-2학기 수강신청 안내자료, 학사안내 자료, 수강제한 강좌 목록,
   타학과 전공선택 인정 교과목, 개설학과별 시간표 (5종 병합)
 - **교수진 정보**: 전자공학과 교수소개 페이지
@@ -85,6 +105,17 @@ uv run python scripts/make_faculty_pdf.py   # 교수진 안내 PDF 생성
 ```bash
 uv run streamlit run src/demo/app.py
 ```
+
+### 5. (선택) LangGraph Studio로 그래프 구조 확인
+
+```bash
+uv run langgraph dev
+```
+
+터미널에 뜨는 Studio UI 링크(`https://smith.langchain.com/studio/?baseUrl=...`)를
+열면 노드/엣지 그래프를 시각적으로 확인하고 직접 질문을 넣어볼 수 있다.
+SQL 조회 결과 표(dataframe)는 JSON 직렬화가 안 돼 Studio에는 `null`로 보이니,
+표까지 확인하려면 Streamlit 데모를 쓴다.
 
 ## 참고
 
