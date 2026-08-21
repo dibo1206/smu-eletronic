@@ -2,5 +2,5 @@
 __pycache__/
 *.pyc
 .env
-ai/sugang.db
-ai/data/
+sugang.db
+data/

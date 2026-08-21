@@ -6,13 +6,14 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 
-ROOT_DIR = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT_DIR))
+ROOT_DIR = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(ROOT_DIR / "src"))
+sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 load_dotenv(ROOT_DIR / ".env")
 
-from ai.create_db import DB_PATH, main as create_db_main  # noqa: E402
-from ai.rag import PDF_PATHS  # noqa: E402
+from create_db import DB_PATH, main as create_db_main  # noqa: E402
+from ai.retriever import PDF_PATHS  # noqa: E402
 from ai.graph import ask  # noqa: E402
 
 
@@ -25,14 +26,14 @@ def ensure_data_ready():
         st.error(
             "다음 안내 문서 파일이 없습니다: "
             + ", ".join(missing)
-            + " — ai/datasets/ 폴더에 넣어주세요."
+            + " — datasets/ 폴더에 넣어주세요."
         )
         st.stop()
 
 
 st.set_page_config(page_title="수강신청 챗봇", page_icon="📚")
 st.title("📚 전자공학과 수강신청 챗봇")
-st.caption("과목/시간표/경쟁률처럼 데이터가 필요한 질문과, 절차/졸업요건처럼 안내가 필요한 질문 둘 다 물어보세요.")
+st.caption("과목/시간표처럼 데이터가 필요한 질문과, 절차/졸업요건처럼 안내가 필요한 질문 둘 다 물어보세요.")
 
 if "ready" not in st.session_state:
     ensure_data_ready()
@@ -41,16 +42,24 @@ if "ready" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-TYPE_LABEL = {"data": "🗂️ DB 조회", "document": "📄 안내문 검색"}
+TYPE_LABEL = {"data": "🗂️ DB 조회", "document": "📄 안내문 검색", "general": "💬 일반 대화"}
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if msg.get("query_type"):
-            st.caption(TYPE_LABEL.get(msg["query_type"], msg["query_type"]))
+            label = TYPE_LABEL.get(msg["query_type"], msg["query_type"])
+            if msg.get("from_cache"):
+                label += " · 🔁 캐시 재사용"
+            if msg.get("fallback_used"):
+                label += " · ↔️ 다른 경로에서 답 찾음"
+            st.caption(label)
         if msg.get("sql"):
             with st.expander("실행된 SQL 보기"):
                 st.code(msg["sql"], language="sql")
+        if msg.get("dataframe") is not None:
+            with st.expander("조회 결과 표로 보기"):
+                st.dataframe(msg["dataframe"])
         if msg.get("category"):
             st.caption(f"적용된 필터: category = {msg['category']}")
         if msg.get("pages"):
@@ -68,10 +77,18 @@ if question:
             result = ask(question)
 
         st.markdown(result["answer"])
-        st.caption(TYPE_LABEL.get(result["query_type"], result["query_type"]))
+        type_label = TYPE_LABEL.get(result["query_type"], result["query_type"])
+        if result.get("from_cache"):
+            type_label += " · 🔁 캐시 재사용"
+        if result.get("fallback_used"):
+            type_label += " · ↔️ 다른 경로에서 답 찾음"
+        st.caption(type_label)
         if result.get("sql"):
             with st.expander("실행된 SQL 보기"):
                 st.code(result["sql"], language="sql")
+        if result.get("dataframe") is not None:
+            with st.expander("조회 결과 표로 보기"):
+                st.dataframe(result["dataframe"])
         if result.get("category"):
             st.caption(f"적용된 필터: category = {result['category']}")
         if result.get("pages"):
@@ -85,5 +102,8 @@ if question:
             "sql": result.get("sql", ""),
             "pages": result.get("pages", []),
             "category": result.get("category", ""),
+            "dataframe": result.get("dataframe"),
+            "from_cache": result.get("from_cache", False),
+            "fallback_used": result.get("fallback_used", False),
         }
     )

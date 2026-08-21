@@ -10,31 +10,40 @@
 사용자 질문
    │
    ▼
-LangGraph 라우터 (ai/graph.py)
+LangGraph 라우터 (src/ai/graph.py, src/ai/nodes.py)
    │  질문 의도를 "document" / "data"로 분류 (with_structured_output)
    │
-   ├─ document ─▶ RAG 엔진 (ai/rag.py)
+   ├─ document ─▶ RAG 엔진 (src/ai/retriever.py)
    │              메타데이터 필터로 카테고리 좁힌 뒤
    │              Parent Document Retriever로 Qdrant Cloud 검색
    │              → 근거 페이지 기반 답변 생성
+   │              (불충분하면 조건부 엣지로 data_fallback 노드 재시도)
    │
-   └─ data ─────▶ Text2SQL 엔진 (ai/text2sql.py)
+   └─ data ─────▶ Text2SQL 엔진 (src/ai/text2sql.py)
                   LangChain SQLDatabase로 SQL 생성 → 검증 → 실행
                   → 실행 결과 기반 답변 생성
+                  (불충분하면 조건부 엣지로 document_fallback 노드 재시도)
 ```
 
 ## 폴더 구조
 
+rag-system(`src/ai/{state,nodes,graph}.py` 분리) 구조를 그대로 따르고,
+데이터 생성용 일회성 스크립트는 `scripts/`로, 데이터 산출물은
+`data/`·`datasets/`·`sugang.db`로 코드와 분리했다.
+
 | 경로 | 역할 |
 | --- | --- |
-| `ai/create_db.py` | 강좌/수강신청현황 데이터를 SQLite(`ai/sugang.db`)로 적재 |
-| `ai/text2sql.py` | 자연어 → SQL 변환·검증·실행 엔진 |
-| `ai/make_faculty_pdf.py` | 교수진 안내 PDF 생성 |
-| `ai/merge_official_pdfs.py` | 학교 공식 PDF 5종을 하나로 병합 |
-| `ai/rag.py` | PDF 로드 → 청킹 → Qdrant 적재 → Parent Document Retriever + 메타데이터 필터링 |
-| `ai/graph.py` | RAG/Text2SQL 라우팅 (LangGraph) |
-| `ai/datasets/` | RAG용 PDF 원본 (공식자료 통합본, 교수진 안내) |
-| `demo/app.py` | Streamlit 챗봇 UI |
+| `src/ai/state.py` | LangGraph State 정의 |
+| `src/ai/nodes.py` | 분류/검색/SQL 실행 등 실제 노드 로직 + 폴백 라우팅 함수 |
+| `src/ai/graph.py` | 노드를 엣지로 연결해 그래프 조립 (`build_graph`, `ask`) |
+| `src/ai/retriever.py` | PDF 로드 → 청킹 → Qdrant 적재 → Parent Document Retriever + 메타데이터 필터링 |
+| `src/ai/text2sql.py` | 자연어 → SQL 변환·검증·실행 엔진 |
+| `src/demo/app.py` | Streamlit 챗봇 UI |
+| `scripts/create_db.py` | 강좌/수강신청현황/교수진 데이터를 SQLite(`sugang.db`)로 적재 |
+| `scripts/make_faculty_pdf.py`, `make_pdf.py` | 안내 PDF 생성 |
+| `scripts/merge_official_pdfs.py` | 학교 공식 PDF 5종을 하나로 병합 |
+| `datasets/` | RAG용 PDF 원본 (공식자료 통합본, 교수진 안내) |
+| `data/` | 생성된 CSV (gitignore 대상) |
 
 ## 데이터 출처
 
@@ -65,16 +74,16 @@ uv sync
 ### 3. 데이터 준비
 
 ```bash
-uv run python ai/create_db.py          # 강좌 DB 생성
-uv run python ai/make_faculty_pdf.py   # 교수진 안내 PDF 생성
+uv run python scripts/create_db.py          # 강좌 DB 생성
+uv run python scripts/make_faculty_pdf.py   # 교수진 안내 PDF 생성
 ```
 
-(`ai/datasets/2026-2학기_수강신청_공식자료_통합.pdf`는 이미 저장소에 포함되어 있습니다.)
+(`datasets/2026-2학기_수강신청_공식자료_통합.pdf`는 이미 저장소에 포함되어 있습니다.)
 
 ### 4. 실행
 
 ```bash
-uv run streamlit run demo/app.py
+uv run streamlit run src/demo/app.py
 ```
 
 ## 참고

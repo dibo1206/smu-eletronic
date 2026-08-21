@@ -12,8 +12,8 @@ from pathlib import Path
 import fitz
 
 DOWNLOADS = Path("C:/Users/dibo1/Downloads")
-AI_DIR = Path(__file__).parent
-OUT_PATH = AI_DIR / "datasets" / "2026-2학기_수강신청_공식자료_통합.pdf"
+ROOT_DIR = Path(__file__).parent.parent
+OUT_PATH = ROOT_DIR / "datasets" / "2026-2학기_수강신청_공식자료_통합.pdf"
 FONT_PATH = Path("C:/Windows/Fonts/malgun.ttf")
 
 # (원본 파일명, 표지에 쓸 제목)

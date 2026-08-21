@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "sugang-chatbot",
+      "runtimeExecutable": "C:\\Users\\dibo1\\OneDrive\\바탕 화면\\sugang-chatbot\\.venv\\Scripts\\python.exe",
+      "runtimeArgs": ["-m", "streamlit", "run", "src/demo/app.py", "--server.port", "8503"],
+      "port": 8503
+    }
+  ]
+}

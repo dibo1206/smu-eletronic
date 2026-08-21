@@ -11,8 +11,8 @@ from pathlib import Path
 
 import fitz
 
-AI_DIR = Path(__file__).parent
-OUT_PATH = AI_DIR / "datasets" / "수강신청_안내.pdf"
+ROOT_DIR = Path(__file__).parent.parent
+OUT_PATH = ROOT_DIR / "datasets" / "수강신청_안내.pdf"
 FONT_PATH = Path("C:/Windows/Fonts/malgun.ttf")
 
 PAGES = [

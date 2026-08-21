@@ -1,5 +1,4 @@
-"""
-수강신청 챗봇의 RAG 엔진.
+"""수강신청 챗봇의 RAG 엔진.
 
 rag-system의 04번(Parent Document Retriever) + 05번(메타데이터 필터링)
 패턴을 함께 따른다:
@@ -30,9 +29,10 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, PayloadSchemaType, VectorParams
 from qdrant_client import models
 
-load_dotenv(Path(__file__).parent.parent / ".env")
+ROOT_DIR = Path(__file__).parent.parent.parent
+load_dotenv(ROOT_DIR / ".env")
 
-DATASETS_DIR = Path(__file__).parent / "datasets"
+DATASETS_DIR = ROOT_DIR / "datasets"
 PDF_PATHS = [
     DATASETS_DIR / "2026-2학기_수강신청_공식자료_통합.pdf",  # 학교 공식 자료 5종 병합본
     DATASETS_DIR / "교수진_안내.pdf",
@@ -40,7 +40,7 @@ PDF_PATHS = [
 COLLECTION_NAME = "sugang_docs"
 
 # 통합본 PDF 안에서 원본 문서(섹션)별 페이지 범위 → 카테고리.
-# merge_official_pdfs.py가 각 원본 앞에 표지 1장을 넣고 이어붙인 순서와 같다.
+# scripts/merge_official_pdfs.py가 각 원본 앞에 표지 1장을 넣고 이어붙인 순서와 같다.
 MERGED_PDF_CATEGORIES = [
     (1, 10, "수강신청_안내"),
     (11, 56, "학사안내"),
@@ -190,7 +190,7 @@ class RagEngine:
             names = ", ".join(p.name for p in missing)
             raise FileNotFoundError(
                 f"안내 문서가 없습니다: {names}\n"
-                "먼저 `python ai/make_pdf.py`와 `python ai/make_faculty_pdf.py`를 실행하세요."
+                "먼저 `python scripts/make_pdf.py`와 `python scripts/make_faculty_pdf.py`를 실행하세요."
             )
 
         self.llm = init_chat_model("gpt-5.4-mini")
@@ -322,14 +322,19 @@ class RagEngine:
             return result.category
         return None
 
-    def answer(self, question: str) -> dict:
-        category = self.determine_category(question)
-        retrieved = self.retriever.invoke(question, category=category)
+    def answer(self, question: str, search_query: Optional[str] = None) -> dict:
+        """search_query를 따로 주면 검색(카테고리 판단·벡터 검색)에는 그걸 쓰고,
+        답변 생성에는 원래 question을 쓴다 — rewrite_query로 검색어만
+        재작성했을 때 최종 답변이 재작성된 문장이 아니라 사용자의 원래
+        질문에 답하도록 하기 위해서다."""
+        query_for_search = search_query or question
+        category = self.determine_category(query_for_search)
+        retrieved = self.retriever.invoke(query_for_search, category=category)
 
         # 카테고리 분류가 잘못돼서 결과가 하나도 없으면, 필터 없이 한 번 더 검색
         if not retrieved and category:
             category = None
-            retrieved = self.retriever.invoke(question, category=None)
+            retrieved = self.retriever.invoke(query_for_search, category=None)
 
         context_parts = [
             f"[{doc.metadata.get('source', '?')} - 페이지 {doc.metadata.get('page', '?')}]\n{doc.page_content}"

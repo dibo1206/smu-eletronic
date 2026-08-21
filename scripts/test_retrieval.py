@@ -11,9 +11,9 @@ rag-system 04번 노트북(섹션 4) 패턴 그대로:
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from ai.rag import get_rag_engine  # noqa: E402
+from ai.retriever import get_rag_engine  # noqa: E402
 
 
 def compare(question: str, category: str | None = None):
