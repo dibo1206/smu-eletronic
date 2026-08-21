@@ -1,4 +1,4 @@
-"""수강신청 챗봇 데모 (Streamlit) — RAG + Text2SQL을 LangGraph로 라우팅."""
+"""챗봇 데모 (Streamlit) — RAG + Text2SQL을 LangGraph로 라우팅."""
 
 import sys
 from pathlib import Path
@@ -31,9 +31,9 @@ def ensure_data_ready():
         st.stop()
 
 
-st.set_page_config(page_title="수강신청 챗봇", page_icon="📚")
-st.title("📚 전자공학과 수강신청 챗봇")
-st.caption("과목/시간표처럼 데이터가 필요한 질문과, 절차/졸업요건처럼 안내가 필요한 질문 둘 다 물어보세요.")
+st.set_page_config(page_title="공과대학 챗봇", page_icon="📚")
+st.title("📚 상명대 공과대학 챗봇")
+st.caption("과목/시간표, 절차/졸업요건뿐 아니라 자격증·취업분야·진출직업 같은 진로 질문까지 무엇이든 물어보세요.")
 
 if "ready" not in st.session_state:
     ensure_data_ready()

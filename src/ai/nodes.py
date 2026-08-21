@@ -59,19 +59,37 @@ _classifier_llm = init_chat_model("gpt-5.4-mini", temperature=0)
 MAX_REWRITE_RETRIES = 2  # document 경로: 질문 재작성 재시도 횟수
 MAX_SQL_RETRIES = 2  # data 경로: SQL 재생성 재시도 횟수
 
-INSUFFICIENT_PHRASES = [
-    "정보가 없습니다", "확인할 수 없습니다", "찾을 수 없습니다",
-    "해당 정보가 없습니다", "결과가 없", "알 수 없습니다",
-]
+class DocumentSummary(BaseModel):
+    """RAG 답변이 질문에 실제로 쓸모 있는 정보를 줬는지 판단한다.
+
+    예전엔 "확인되지 않았습니다" 같은 고정 문구를 답변에서 찾는 방식이었는데,
+    복합 질문에서 일부만 답할 때 그 답변이 (안내 프롬프트 지시대로) "OOO는
+    확인하지 못했습니다"라는 캐비엇을 정직하게 붙이는 바람에, 실제로는
+    쓸모 있는 정보(예: 교양 과목 2개 추천)가 들어있는 답변까지 문구 하나
+    때문에 전부 불충분으로 오판되는 문제가 있었다. SQL 쪽(SqlSummary)과
+    같은 방식으로 구조화된 판단으로 바꿔서 이 문제를 없앤다."""
+
+    sufficient: bool = Field(
+        description="답변에 질문과 관련된 구체적이고 실질적인 정보(과목명, "
+        "시간, 규정 등 실제 내용)가 하나라도 포함돼 있으면 true — 질문의 "
+        "일부만 답했고 나머지는 확인 못 했다는 캐비엇이 섞여 있어도, 답한 "
+        "부분에 실제 정보가 있으면 true다. 답변이 사실상 '못 찾았다'는 "
+        "내용뿐이면 false."
+    )
 
 
-def _is_insufficient(answer: str, has_evidence: bool) -> bool:
-    """RAG 답변이 사실상 '못 찾았다'는 뜻인지 판단한다.
-    RAG 프롬프트(ai/retriever.py)가 이 문구들을 쓰도록 고정 지시돼 있어서
-    문구 매칭으로도 안정적으로 잡힌다."""
+def _is_insufficient(question: str, answer: str, has_evidence: bool) -> bool:
+    """RAG 답변이 사실상 '못 찾았다'는 뜻인지 판단한다."""
     if not has_evidence:
         return True
-    return any(phrase in answer for phrase in INSUFFICIENT_PHRASES)
+    structured_llm = _llm.with_structured_output(DocumentSummary)
+    prompt = f"""다음은 안내 문서를 검색해서 생성한 답변입니다. 질문에 실질적으로
+도움이 되는 구체적인 정보가 들어있는지 판단하세요.
+
+질문: {question}
+답변: {answer}"""
+    result = structured_llm.invoke(prompt)
+    return not result.sufficient
 
 
 class SqlSummary(BaseModel):
@@ -125,20 +143,24 @@ def classify_query(state: State) -> dict:
 
 [2단계] 학사 안내문(규정/설명)에 있는 내용인가? → 그렇다면 document.
 - 수강신청 절차, 정정기간, 유의사항, 졸업요건, 복수전공, 재수강 규정
-- 교수님 **본인 신상**(세부전공, 연구실 위치, 학위, 개인 연락처)
 - **교양 과목**(기초교양/균형교양 등 "교양"이 붙은 과목)의 시간표·담당교수·추천
   — 교양 과목 시간표는 DB가 아니라 안내 문서에만 들어있다.
 예(document): "졸업하려면 전공 몇 학점이야?", "재수강 규정이 어떻게 돼?",
-    "이흥주 교수님 연구실이 어디야?", "조준희 교수님 세부전공이 뭐야?",
     "예술 영역 교양 과목 추천해줘", "영어 교양 과목 뭐 있어?"
 
-[3단계] 여기까지 왔으면 data. 강좌 DB(과목/시간표/경쟁률/담당교수)를
-조회해야 답할 수 있는 질문이다. 교수님의 **신상이 아니라 그 교수가
-맡은 과목**(개수·목록·시간표)을 묻는 것이면 신상 질문처럼 보여도 항상
-data다.
+[3단계] 여기까지 왔으면 data. 강좌 DB(과목/시간표/경쟁률/담당교수),
+교수진 DB(학위/세부전공/연구실/연락처), 진로정보 DB(학과별 취업분야/
+진출직업/관련자격증)를 조회해야 답할 수 있는 질문이다.
+교수님에 대한 질문은 담당 과목(개수·목록·시간표)이든 본인 신상(세부전공,
+연구실, 연락처)이든 항상 data다 — 공과대학 11개 학과 교수님 정보가
+교수진 DB에 있다. 자격증·취업·진로·회사 관련 질문도 항상 data다 —
+공과대학 11개 학과 전체의 진로정보가 DB에 있다.
 예(data): "2학년 전공심화 과목 알려줘", "화요일에 열리는 강의는?",
     "정민철 교수님이 담당하는 과목이 뭐야?",
-    "이흥주 교수님이 담당하는 과목 개수는?"
+    "이흥주 교수님이 담당하는 과목 개수는?",
+    "이흥주 교수님 연구실이 어디야?", "조준희 교수님 세부전공이 뭐야?",
+    "정보보안공학과 관련 자격증 뭐 있어?", "전자공학과 졸업하면 어떤 회사 가?",
+    "지능형로봇학과 진출 직업이 뭐야?"
 
 혼동하기 쉬운 경우 — "챗봇이 뭘 할 수 있는지"를 추상적으로 묻는 것은
 general이지만, "실제 과목/정보가 뭐가 있는지" 구체적으로 묻는 것은
@@ -160,10 +182,11 @@ def general_answer(state: State) -> dict:
     """rag-system 베이스라인의 general_answer와 같은 역할 —
     검색 없이 LLM이 바로 답하고 END로 간다 (폴백 대상이 아니다)."""
     question = _get_question(state)
-    system_prompt = """당신은 상명대학교 전자공학과 수강신청 챗봇입니다.
+    system_prompt = """당신은 상명대학교 공과대학 학사·진로 안내 챗봇입니다.
 인사나 잡담, 챗봇 자체에 대한 질문에 친절하고 자연스럽게 답변하세요.
 필요하면 이 챗봇으로 수강신청 절차, 졸업요건, 과목 시간표·경쟁률,
-교수님 정보 등을 물어볼 수 있다고 안내하세요."""
+교수님 정보뿐 아니라 학과별 취업분야·진출직업·관련 자격증 같은 진로
+정보도 물어볼 수 있다고 안내하세요."""
     response = _llm.invoke(
         [SystemMessage(content=system_prompt), HumanMessage(content=question)]
     )
@@ -176,8 +199,14 @@ def _document_node(state: State, *, is_fallback: bool) -> dict:
     # 최종 답변은 항상 사용자의 원래 질문에 맞춰 생성한다.
     search_query = state.get("rewritten_query") if not is_fallback else None
     result = get_rag_engine().answer(question, search_query=search_query)
+    insufficient = _is_insufficient(question, result["answer"], bool(result["pages"]))
 
-    return {
+    if is_fallback and insufficient and state.get("primary_result"):
+        # 폴백도 부족하면, 원래 있던 (비록 불완전해도 더 나은) 답을
+        # "조회된 결과가 없습니다" 같은 걸로 덮어쓰지 않고 그대로 유지한다.
+        return {**state["primary_result"], "fallback_used": False, "insufficient": False}
+
+    output = {
         "messages": [AIMessage(content=result["answer"])],
         "query_type": "document",
         # data 노드가 먼저 시도했던 SQL이 있으면 참고용으로 그대로 남겨둔다
@@ -187,8 +216,11 @@ def _document_node(state: State, *, is_fallback: bool) -> dict:
         "dataframe": None,
         "from_cache": False,
         "fallback_used": is_fallback,
-        "insufficient": _is_insufficient(result["answer"], bool(result["pages"])),
+        "insufficient": insufficient,
     }
+    if not is_fallback:
+        output["primary_result"] = dict(output)
+    return output
 
 
 def rewrite_document_query(state: State) -> dict:
@@ -235,6 +267,11 @@ def _data_node(state: State, *, is_fallback: bool) -> dict:
         answer = "조회된 결과가 없습니다."
         sufficient = False
 
+    if is_fallback and not sufficient and state.get("primary_result"):
+        # 폴백(SQL)도 부족하면, 원래 있던 (비록 불완전해도 더 나은) 답을
+        # "조회된 결과가 없습니다" 같은 걸로 덮어쓰지 않고 그대로 유지한다.
+        return {**state["primary_result"], "fallback_used": False, "insufficient": False}
+
     result_dict = {
         "messages": [AIMessage(content=answer)],
         "query_type": "data",
@@ -248,6 +285,7 @@ def _data_node(state: State, *, is_fallback: bool) -> dict:
     }
     if not is_fallback:
         result_dict["retry_count"] = retry_count + 1
+        result_dict["primary_result"] = dict(result_dict)
     return result_dict
 
 

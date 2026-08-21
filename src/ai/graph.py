@@ -98,6 +98,7 @@ def ask(question: str) -> dict:
             "insufficient": False,
             "retry_count": 0,
             "rewritten_query": None,
+            "primary_result": None,
         }
     )
     return {

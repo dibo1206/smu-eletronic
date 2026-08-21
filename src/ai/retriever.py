@@ -57,6 +57,12 @@ GYOYANG_PAGE_RANGE = (158, 172)
 COURSE_CODE_RE = re.compile(r"HB[A-Z]{2}\d{3,4}")
 GYOYANG_AREA_RE = re.compile(r"(기초|균형)\(([^)]*)\)")
 
+# 상명대 공과대학 학과별 시간표(통합본 143~157페이지, 11개 학과/전공)도
+# 페이지 통째가 아니라 과목 단위로 쪼갠다 — 안 그러면 "2학년만" 같은 질문에서
+# LLM이 뒤죽박죽인 원본 표 텍스트를 직접 읽고 학년을 스스로 걸러내야 해서
+# 틀리기 쉽다 (실제로 1학년 과목을 2학년으로 잘못 답한 적이 있다).
+DEPARTMENT_TIMETABLE_PAGES = range(143, 158)
+
 GYOYANG_AREA_DESCRIPTIONS = {
     "교양_기초(사고와표현)": "글쓰기/의사표현 관련 기초교양 과목",
     "교양_기초(영어)": "영어 관련 기초교양 과목",
@@ -75,18 +81,37 @@ CATEGORY_DESCRIPTIONS = {
     "수강신청_안내": "수강신청 기간, 절차, 방법, 정정기간 등 신청 방법 자체에 대한 안내",
     "학사안내": "학사일정, 등록, 성적, 졸업, 복수전공/부전공 등 전반적인 학사 규정",
     "수강제한_강좌목록": "특정 강좌를 주전공 학생 외에는 수강신청 1일차에 못 듣는 제한 규정/목록",
-    "타학과_인정과목": "전자공학과 학생이 타 학과 과목을 전공선택으로 인정받을 수 있는 교과목 목록",
-    "개설학과별_시간표": "특정 전공 과목의 담당교수, 강의시간, 강의실, 수강정원 등 시간표 정보",
-    "교수진_안내": "전자공학과 교수님 개인 정보(세부전공, 연구실, 연락처)",
+    "타학과_인정과목": "공과대학 학생이 다른 학과 과목을 전공선택으로 인정받을 수 있는 교과목 목록",
+    "개설학과별_시간표": "상명대 공과대학 11개 학과/전공의 2026-2학기 개설강좌 담당교수, 강의시간, 강의실 등 시간표 정보",
+    "교수진_안내": "전자공학과 교수님 개인 정보(세부전공, 연구실, 연락처) — 다른 학과 교수님은 이 정보가 없음",
     **GYOYANG_AREA_DESCRIPTIONS,
 }
 
+# 공과대학 개설학과별 시간표(143~157페이지)에 실제로 있는 학과/전공 목록.
+# classify_query가 department를 뽑을 때 이 목록과 맞춰본다.
+DEPARTMENT_NAMES = [
+    "전자공학과", "소프트웨어학과", "스마트정보통신공학과", "경영공학과",
+    "그린화학공학과", "건설시스템공학과", "정보보안공학과", "시스템반도체공학과",
+    "휴먼지능로봇공학과", "지능형로봇학과", "AI모빌리티공학과",
+]
 
-def _category_for_page(pdf_stem: str, page_num: int) -> str:
+
+def _category_for_page(pdf_stem: str, page_num: int, page_text: str = "") -> Optional[str]:
+    """페이지 하나의 카테고리를 정한다.
+
+    "개설학과별_시간표" 페이지 범위(97~157, 173~200)는 공과대학뿐 아니라
+    학교 전체 학과 시간표가 섞여 있다(예술대학, 디자인대학 등). 이 챗봇은
+    공과대학 전용이라 다른 단과대학 페이지까지 색인해두면, 검색이 엉뚱한
+    학과 시간표를 반환할 위험만 생긴다 (실제로 "연극전공" 시간표가 뽑힌 적이
+    있었다). 그래서 이 범위에서는 페이지 표제가 "공과대학"으로 시작하는
+    페이지만 색인하고, 나머지는 None을 반환해 아예 건너뛴다.
+    """
     if pdf_stem == "교수진_안내":
         return "교수진_안내"
     for start, end, category in MERGED_PDF_CATEGORIES:
         if start <= page_num <= end:
+            if category == "개설학과별_시간표" and _department_from_header(page_text) is None:
+                return None
             return category
     return "기타"
 
@@ -115,19 +140,107 @@ def _split_gyoyang_rows(page_text: str) -> list[tuple[str, str]]:
     return rows
 
 
-class CategoryClassification(BaseModel):
-    """질문에 가장 적합한 카테고리 분류 결과."""
+def _department_from_header(page_text: str) -> Optional[str]:
+    """페이지 2번째 줄("공과대학XXX")에서 학과명을 뽑는다.
+    학과명 없이 "공과대학"만 있으면(143페이지 취업과창업 같은 공통 과목)
+    "공과대학 공통"으로 취급한다."""
+    lines = [line for line in page_text.split("\n") if line.strip()]
+    if len(lines) < 2 or not lines[1].strip().startswith("공과대학"):
+        return None
+    name = lines[1].strip()[len("공과대학"):].strip()
+    return name or "공과대학 공통"
 
-    category: Optional[str] = Field(
-        description="선택된 카테고리 이름. 여러 카테고리에 걸치거나 애매하면 None"
+
+def _split_department_timetable_rows(page_text: str) -> list[tuple[int, str, str]]:
+    """공과대학 개설학과별 시간표(143~157페이지)를 과목 단위로 잘라서
+    [(학년, 과목명, 행 텍스트), ...]로 반환한다.
+
+    PyMuPDF가 셀 단위로 뽑아내는 이 표는 "No / 학년 / 이수구분 / 학수번호
+    +교과목명 / ..." 순서인데, 두 가지 변형이 섞여 있다:
+    - 이수구분이 "1전선"처럼 따로 줄이 되는 행: 학년은 코드 줄의 2줄 앞
+    - 이수구분이 코드와 한 줄에 붙어버리는 행(예: "1전선HBMA1008..."):
+      학년은 코드 줄의 1줄 앞
+    그래서 1줄 앞부터 먼저 확인하고, 아니면 2줄 앞을 확인한다.
+
+    교과목명이 길면 줄바꿈되기도 해서(예: "Verilog기반디지털시스템설계(P" /
+    "BL)"), 다음 줄이 숫자(학점)가 아닌 동안은 이름의 연속으로 보고 이어붙인다."""
+    lines = [line for line in page_text.split("\n") if line.strip()]
+    code_line_indices = [i for i, line in enumerate(lines) if COURSE_CODE_RE.search(line)]
+
+    def _grade_and_row_start(code_idx: int) -> tuple[Optional[int], Optional[int]]:
+        for back in (1, 2):
+            idx = code_idx - back
+            if idx < 0:
+                continue
+            m = re.match(r"^\s*([1-4])\s*$", lines[idx])
+            if m:
+                return int(m.group(1)), idx - 1  # No는 학년 한 줄 앞
+        return None, None
+
+    rows = []
+    for pos, i in enumerate(code_line_indices):
+        grade, _ = _grade_and_row_start(i)
+        if grade is None:
+            continue
+
+        code_match = COURSE_CODE_RE.search(lines[i])
+        course_name = lines[i][code_match.end():].strip()
+        j = i + 1
+        while j < len(lines) and not re.match(r"^\d+(\.\d+)?$", lines[j].strip()):
+            course_name += lines[j].strip()
+            j += 1
+
+        if pos + 1 < len(code_line_indices):
+            _, next_row_start = _grade_and_row_start(code_line_indices[pos + 1])
+            end = next_row_start if next_row_start is not None else code_line_indices[pos + 1]
+        else:
+            end = len(lines)
+        block = "\n".join(lines[i:max(end, i + 1)])
+
+        rows.append((grade, course_name, block))
+    return rows
+
+
+class CategoryClassification(BaseModel):
+    """질문에 가장 적합한 카테고리 분류 결과.
+
+    rag-system 05번 노트북의 "복합 필터링(OR 조건)" 패턴 — 카테고리를
+    하나만 강제로 고르게 하면, "전공 시간표 피해서 교양 추천해줘"처럼
+    두 주제가 섞인 질문에서 한쪽 정보가 아예 검색조차 안 되는 문제가
+    있었다. 리스트로 받아서 Qdrant의 should(OR) 필터로 여러 카테고리를
+    한 번에 검색한다."""
+
+    categories: Optional[List[str]] = Field(
+        description="선택된 카테고리 이름 목록 (1~3개). 적합한 카테고리가 전혀 없으면 빈 리스트"
+    )
+    grade: Optional[int] = Field(
+        default=None,
+        description="질문이 특정 학년(1~4)의 전공 시간표만 콕 집어 물어보면 "
+        "그 학년 숫자(예: '2학년 전공 시간표' → 2). 학년을 지정하지 않았거나 "
+        "교양처럼 학년과 무관한 질문이면 null.",
+    )
+    department: Optional[str] = Field(
+        default=None,
+        description="질문이 공과대학 특정 학과(전자공학과, 소프트웨어학과 등)의 "
+        "전공 시간표를 콕 집어 물어보면 그 학과 이름. 학과를 지정하지 않았거나 "
+        "교양처럼 학과와 무관한 질문이면 null.",
     )
 
 PROMPT = PromptTemplate(
     input_variables=["context", "question"],
-    template="""당신은 상명대학교 전자공학과 학사 안내 전문가입니다.
+    template="""당신은 상명대학교 공과대학 학사 안내 전문가입니다.
 주어진 정보를 바탕으로 사용자의 질문에 정확하고 친절하게 답변하세요.
 답변에 참고한 문서의 이름과 페이지 번호를 함께 밝히세요.
-주어진 정보에 없는 내용은 추측하지 말고 "안내 문서에 해당 정보가 없습니다"라고 답하세요.
+
+질문이 여러 요청을 한 번에 담고 있어서 그 중 일부만 아래 정보로 답할 수
+있다면, 답할 수 있는 부분만 답하고 나머지는 "이 답변에서는 OOO 정보는
+확인하지 못했습니다. OOO만 따로 다시 물어봐 주세요"처럼 어떤 부분이
+빠졌는지 구체적으로 밝히세요.
+
+주어진 정보에 없는 내용은 추측하지 마세요. 다만 "안내 문서에 해당 정보가
+없습니다"처럼 문서 전체에 아예 없다고 단정하지 말고, "이번 검색 결과에서는
+확인되지 않았습니다"처럼 이번 조회 범위에서 못 찾았다는 뜻으로 표현하세요
+(실제로는 다른 페이지에 있을 수 있습니다).
 
 <context>
 {context}
@@ -148,27 +261,76 @@ class ParentDocumentRetriever:
         self.parent_docstore = parent_docstore
         self.k = k
 
-    def _build_filter(self, category: Optional[str]) -> Optional["models.Filter"]:
-        if not category:
+    def _build_filter(
+        self,
+        categories: Optional[List[str]] = None,
+        page_range: Optional[tuple[int, int]] = None,
+        grade: Optional[int] = None,
+        department: Optional[str] = None,
+    ) -> Optional["models.Filter"]:
+        """categories가 여러 개면 should(OR)로 묶는다 — rag-system 05번의
+        "4-3. 복합 필터링(OR 조건)" 패턴. page_range/grade/department는 각
+        카테고리 안에서 must(AND)로 겹쳐 건다 — "4-6. 복합 조건(AND + Range)" 패턴.
+
+        grade/department는 카테고리별 서브 필터 안에만 넣는다 — "개설학과별_시간표"만
+        학년(metadata.grade)·학과(metadata.department) 메타데이터가 있고
+        교양/교수진 등은 그 필드가 아예 없어서, 전체에 그냥 AND로 걸면 그
+        필드가 없는 다른 카테고리 문서가 전부 걸러져버린다 (실제로 이 문제로
+        교양 검색 결과가 통째로 사라진 적이 있다)."""
+        if not categories:
             return None
-        return models.Filter(
-            must=[
+
+        def _category_filter(category: str) -> "models.Filter":
+            conditions = [
                 models.FieldCondition(
                     key="metadata.category", match=models.MatchValue(value=category)
                 )
             ]
-        )
+            if page_range:
+                gte, lte = page_range
+                conditions.append(
+                    models.FieldCondition(key="metadata.page", range=models.Range(gte=gte, lte=lte))
+                )
+            if category == "개설학과별_시간표":
+                if grade:
+                    conditions.append(
+                        models.FieldCondition(key="metadata.grade", match=models.MatchValue(value=grade))
+                    )
+                if department:
+                    conditions.append(
+                        models.FieldCondition(
+                            key="metadata.department", match=models.MatchValue(value=department)
+                        )
+                    )
+            return models.Filter(must=conditions)
+
+        return models.Filter(should=[_category_filter(c) for c in categories])
 
     def get_child_chunks(
-        self, query: str, category: Optional[str] = None, k: Optional[int] = None
+        self,
+        query: str,
+        categories: Optional[List[str]] = None,
+        page_range: Optional[tuple[int, int]] = None,
+        grade: Optional[int] = None,
+        department: Optional[str] = None,
+        k: Optional[int] = None,
     ) -> List[Document]:
         """비교용: parent로 확장하지 않고 검색된 child chunk 자체를 반환한다."""
         return self.vectorstore.similarity_search(
-            query, k=k or self.k, filter=self._build_filter(category)
+            query, k=k or self.k, filter=self._build_filter(categories, page_range, grade, department)
         )
 
-    def invoke(self, query: str, category: Optional[str] = None) -> List[Document]:
-        child_results = self.get_child_chunks(query, category=category)
+    def invoke(
+        self,
+        query: str,
+        categories: Optional[List[str]] = None,
+        page_range: Optional[tuple[int, int]] = None,
+        grade: Optional[int] = None,
+        department: Optional[str] = None,
+    ) -> List[Document]:
+        child_results = self.get_child_chunks(
+            query, categories=categories, page_range=page_range, grade=grade, department=department
+        )
 
         parent_ids = []
         for doc in child_results:
@@ -207,7 +369,9 @@ class RagEngine:
         vectorstore = QdrantVectorStore(
             client=self.client, collection_name=COLLECTION_NAME, embedding=self.embeddings
         )
-        self.retriever = ParentDocumentRetriever(vectorstore, self.parent_docstore, k=3)
+        # k를 3→5로 늘림: should(OR) 필터로 카테고리 여러 개를 한 번에 검색할 때
+        # 각 카테고리에서 최소한 한두 개씩은 뽑힐 여지를 주기 위해서다.
+        self.retriever = ParentDocumentRetriever(vectorstore, self.parent_docstore, k=5)
 
     def _load_and_split(self):
         import fitz
@@ -247,6 +411,34 @@ class RagEngine:
                         continue
                     # 이 페이지에서 과목을 하나도 못 뽑았으면 페이지 통째로 폴백
 
+                is_department_page = is_merged_pdf and page in DEPARTMENT_TIMETABLE_PAGES
+                if is_department_page:
+                    unsorted_text = doc[page_num].get_text("text")
+                    department = _department_from_header(unsorted_text)
+                    dept_rows = _split_department_timetable_rows(unsorted_text) if department else []
+                    for row_idx, (grade, course_name, row_text) in enumerate(dept_rows):
+                        docs.append(
+                            Document(
+                                page_content=f"[{department} {grade}학년] {course_name}\n{row_text}",
+                                metadata={
+                                    "source": pdf_path.name,
+                                    "page": page,
+                                    "parent_id": f"{pdf_path.stem}_page_{page}_row_{row_idx}",
+                                    "department": department,
+                                    "category": "개설학과별_시간표",
+                                    "grade": grade,
+                                },
+                            )
+                        )
+                    if dept_rows:
+                        continue
+                    # 과목을 하나도 못 뽑았으면 페이지 통째로 폴백
+
+                category = _category_for_page(pdf_path.stem, page, text)
+                if category is None:
+                    # 공과대학과 무관한 다른 단과대학 시간표 페이지 — 색인하지 않는다
+                    continue
+
                 docs.append(
                     Document(
                         page_content=text,
@@ -254,7 +446,7 @@ class RagEngine:
                             "source": pdf_path.name,
                             "page": page,
                             "parent_id": f"{pdf_path.stem}_page_{page}",
-                            "category": _category_for_page(pdf_path.stem, page),
+                            "category": category,
                         },
                     )
                 )
@@ -286,6 +478,24 @@ class RagEngine:
             field_name="metadata.category",
             field_schema=PayloadSchemaType.KEYWORD,
         )
+        # 페이지 범위(range) 필터용 인덱스 — 카테고리 AND 페이지 범위 복합 조건에 쓴다
+        self.client.create_payload_index(
+            collection_name=COLLECTION_NAME,
+            field_name="metadata.page",
+            field_schema=PayloadSchemaType.INTEGER,
+        )
+        # 학년(grade) 필터용 인덱스 — 개설학과별_시간표 카테고리 AND 학년 복합 조건에 쓴다
+        self.client.create_payload_index(
+            collection_name=COLLECTION_NAME,
+            field_name="metadata.grade",
+            field_schema=PayloadSchemaType.INTEGER,
+        )
+        # 학과(department) 필터용 인덱스 — 개설학과별_시간표 카테고리 AND 학과 복합 조건에 쓴다
+        self.client.create_payload_index(
+            collection_name=COLLECTION_NAME,
+            field_name="metadata.department",
+            field_schema=PayloadSchemaType.KEYWORD,
+        )
         vectorstore = QdrantVectorStore(
             client=self.client, collection_name=COLLECTION_NAME, embedding=self.embeddings
         )
@@ -296,31 +506,58 @@ class RagEngine:
             vectorstore.add_documents(documents=batch)
             print(f"  업로드 중... {min(i + batch_size, len(child_docs))}/{len(child_docs)}")
 
-    def determine_category(self, question: str) -> Optional[str]:
-        """질문을 보고 어느 카테고리를 검색할지 LLM으로 동적으로 판단한다.
-        애매하거나 여러 카테고리에 걸치면 None(필터 없음)을 반환한다."""
+    def determine_category(
+        self, question: str
+    ) -> tuple[Optional[List[str]], Optional[int], Optional[str]]:
+        """질문을 보고 어느 카테고리(들)를 검색할지, 그리고 특정 학년/학과로
+        더 좁혀야 하는지 LLM으로 동적으로 판단한다. 질문이 한 주제만
+        다루면 카테고리 하나, 여러 주제가 섞여 있으면 여러 개를 함께
+        돌려준다 (rag-system 05번의 복합 필터링 패턴)."""
         category_list = "\n".join(
             f"- {cat}: {desc}" for cat, desc in CATEGORY_DESCRIPTIONS.items()
         )
-        prompt = f"""다음 질문을 분석하여 가장 적합한 카테고리를 선택하세요.
+        department_list = ", ".join(DEPARTMENT_NAMES)
+        prompt = f"""다음 질문을 분석하여 검색에 사용할 카테고리를 선택하세요.
 
 <available_categories>
 {category_list}
 </available_categories>
+
+<engineering_departments>
+{department_list}
+</engineering_departments>
 
 <question>
 {question}
 </question>
 
 <rules>
-1. 질문과 가장 관련 있는 카테고리 하나만 선택하세요.
-2. 여러 카테고리에 걸치거나 애매하면 category를 null로 두세요.
+1. 질문이 한 가지 주제만 다루면 가장 관련 있는 카테고리 하나만 선택하세요.
+2. 질문이 서로 다른 주제를 동시에 묻고 있으면(예: "전공 시간표를 피해서
+   교양 추천해줘"는 시간표 주제 + 교양 주제) 관련된 카테고리를 모두,
+   최대 3개까지 함께 선택하세요.
+3. "교양 추천해줘"처럼 구체적인 교양 영역(예술/인문/사회 등)을 지정하지
+   않았으면, 관련성 있어 보이는 교양_* 카테고리를 2~3개 함께 선택하세요.
+4. 전혀 애매하면 categories를 빈 리스트로 두세요.
+5. 질문이 특정 학년(1~4학년)의 전공 시간표를 콕 집어 물어보면 grade에
+   그 숫자를 넣으세요. 학년을 지정하지 않았거나 교양 관련 질문이면 grade는
+   null로 두세요.
+6. 질문이 <engineering_departments> 중 특정 학과의 전공 시간표를 콕 집어
+   물어보면 department에 그 학과 이름을 정확히 넣으세요. 학과를 지정하지
+   않았거나 교양 관련 질문이면 department는 null로 두세요.
 </rules>"""
         structured_llm = self.llm.with_structured_output(CategoryClassification)
         result = structured_llm.invoke(prompt)
-        if result.category in CATEGORY_DESCRIPTIONS:
-            return result.category
-        return None
+        valid = [c for c in (result.categories or []) if c in CATEGORY_DESCRIPTIONS]
+        # LLM이 지침(최대 3개)을 안 지키고 더 많이 고를 때가 있어서 코드로 한 번 더 자른다 —
+        # 카테고리가 많을수록 공유 k(검색 개수)가 잘게 쪼개져 정작 중요한
+        # 카테고리가 밀려날 수 있다. "개설학과별_시간표"는 잘리지 않도록 맨 앞으로 옮겨둔다
+        # (뒤에서 별도로 학년/학과 보장 검색도 이 카테고리가 남아있어야 작동한다).
+        if "개설학과별_시간표" in valid:
+            valid = ["개설학과별_시간표"] + [c for c in valid if c != "개설학과별_시간표"]
+        valid = valid[:3]
+        department = result.department if result.department in DEPARTMENT_NAMES else None
+        return (valid or None), result.grade, department
 
     def answer(self, question: str, search_query: Optional[str] = None) -> dict:
         """search_query를 따로 주면 검색(카테고리 판단·벡터 검색)에는 그걸 쓰고,
@@ -328,13 +565,28 @@ class RagEngine:
         재작성했을 때 최종 답변이 재작성된 문장이 아니라 사용자의 원래
         질문에 답하도록 하기 위해서다."""
         query_for_search = search_query or question
-        category = self.determine_category(query_for_search)
-        retrieved = self.retriever.invoke(query_for_search, category=category)
+        categories, grade, department = self.determine_category(query_for_search)
+        retrieved = self.retriever.invoke(
+            query_for_search, categories=categories, grade=grade, department=department
+        )
 
         # 카테고리 분류가 잘못돼서 결과가 하나도 없으면, 필터 없이 한 번 더 검색
-        if not retrieved and category:
-            category = None
-            retrieved = self.retriever.invoke(query_for_search, category=None)
+        if not retrieved and categories:
+            categories = None
+            retrieved = self.retriever.invoke(query_for_search, categories=None)
+
+        # 학년/학과까지 지정된 전공 시간표는 다른 카테고리들과 검색 결과
+        # 개수(k)를 나눠 갖다 보면 밀려날 수 있어서 (교양 카테고리가 여러 개
+        # 섞이면 특히 그렇다), 항상 별도로 한 번 더 가져와서 빠지지 않게 보장한다.
+        if (grade or department) and categories and "개설학과별_시간표" in categories:
+            narrowed_docs = self.retriever.invoke(
+                query_for_search, categories=["개설학과별_시간표"], grade=grade, department=department
+            )
+            existing_ids = {d.metadata.get("parent_id") for d in retrieved}
+            for doc in narrowed_docs:
+                if doc.metadata.get("parent_id") not in existing_ids:
+                    retrieved.append(doc)
+                    existing_ids.add(doc.metadata.get("parent_id"))
 
         context_parts = [
             f"[{doc.metadata.get('source', '?')} - 페이지 {doc.metadata.get('page', '?')}]\n{doc.page_content}"
@@ -347,7 +599,7 @@ class RagEngine:
 
         return {
             "answer": response.content,
-            "category": category,
+            "category": ", ".join(categories) if categories else None,
             "pages": [
                 f"{doc.metadata.get('source', '?')} p.{doc.metadata.get('page', '?')}"
                 for doc in retrieved

@@ -23,3 +23,4 @@ class State(TypedDict):
     insufficient: bool
     retry_count: int
     rewritten_query: Optional[str]
+    primary_result: Optional[dict]
