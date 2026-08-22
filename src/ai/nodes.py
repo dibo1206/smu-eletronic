@@ -26,6 +26,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal
 
+import pandas as pd
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -106,8 +107,29 @@ class SqlSummary(BaseModel):
 
 
 def _summarize_sql_result(question: str, sql: str, result) -> SqlSummary:
+    """SQL 결과를 자연어 답변으로 요약한다.
+
+    진로정보 테이블을 조회한 경우에만 학교 CSV보다 LLM이 더 잘 아는
+    영역(자격증 활용법, 업계 동향 등)이라 일반 지식 보충을 허용한다.
+    이 허용 여부는 "진로정보" 문자열이 SQL에 들어있는지로 코드가 직접
+    판단한다(또 다른 LLM 분류를 추가하면 그 분류 자체가 흔들려서 강좌/
+    교수진 같은 다른 데이터에도 새어 들어갈 위험이 있기 때문). 강좌/
+    교수진/수강신청현황 조회는 지금처럼 SQL 결과 밖으로 못 나가게 그대로
+    막아둔다 — 시간표나 연락처 같은 사실 정보에 LLM이 확인 안 된 내용을
+    섞으면 안 되니까."""
     structured_llm = _llm.with_structured_output(SqlSummary)
-    prompt = f"""다음 SQL 실행 결과를 보고 질문에 답변하세요.
+    if "진로정보" in sql:
+        prompt = f"""다음 SQL 실행 결과를 보고 질문에 답변하세요.
+학교 자료(SQL 결과)가 우선이지만, 자격증 활용처럼 학교 자료에 없는
+일반적인 지식으로 보충 설명을 덧붙여도 됩니다. 다만 학교 자료와 당신의
+일반 지식을 명확히 구분해서 답변하세요 — 예: "학교 자료 기준으로는
+~이고, 일반적으로는 ~" 처럼. 학교 자료인 것처럼 섞어서 말하지 마세요.
+
+질문: {question}
+SQL: {sql}
+실행 결과: {result}"""
+    else:
+        prompt = f"""다음 SQL 실행 결과를 보고 질문에 답변하세요.
 결과에 없는 내용은 추측하지 마세요.
 
 질문: {question}
@@ -118,12 +140,58 @@ SQL: {sql}
 
 def _get_question(state: State) -> str:
     """대화 기록에서 실제 사용자 질문을 찾는다.
+    resolve_question 노드가 이전 대화 맥락을 반영해 다시 쓴 질문이 있으면
+    그걸 쓰고(예: "2학년 전공과목" → "휴먼지능로봇공학과 2학년 전공과목"),
+    없으면(첫 턴 등) 원래 질문으로 폴백한다.
     폴백 노드는 이전 노드가 붙인 AIMessage 뒤에서 실행되므로,
     단순히 마지막 메시지를 읽으면 그 AI 답변을 질문으로 오인하게 된다."""
+    if state.get("resolved_question"):
+        return state["resolved_question"]
     for msg in reversed(state["messages"]):
         if isinstance(msg, HumanMessage):
             return msg.content
     return state["messages"][-1].content
+
+
+class ResolvedQuestion(BaseModel):
+    standalone_question: str = Field(
+        description="이전 대화 맥락까지 반영해 그 자체로 완전한 하나의 질문으로 "
+        "다시 쓴 것. 새 질문이 이미 그 자체로 완전하거나 이전 대화와 무관하면 "
+        "새 질문을 그대로 반환한다."
+    )
+
+
+def resolve_question(state: State) -> dict:
+    """후속 질문이 이전 대화의 주어(학과/학년/교수님 등)를 생략하고 있으면
+    (예: "휴먼지능로봇공학과 전공과목" 다음에 "2학년 전공과목"만 물어보는
+    경우) 이전 맥락을 채워 그 자체로 완전한 질문으로 다시 쓴다. classify_query
+    를 포함한 이후 모든 노드가 _get_question()을 통해 이 결과를 쓰게 되므로,
+    라우팅·검색·SQL 생성이 전부 맥락을 이어받는다."""
+    messages = state["messages"]
+    current = messages[-1].content
+
+    if len(messages) <= 1:
+        # 첫 턴 — 참고할 이전 대화가 없다.
+        return {"resolved_question": current}
+
+    history_text = "\n".join(
+        f"{'사용자' if isinstance(m, HumanMessage) else '챗봇'}: {m.content}"
+        for m in messages[:-1]
+    )
+    structured_llm = _classifier_llm.with_structured_output(ResolvedQuestion)
+    prompt = f"""아래는 챗봇과 사용자의 이전 대화 기록과 사용자의 새 질문입니다.
+새 질문이 이전 대화에서 언급된 학과/학년/교수님 등 주어를 생략한 후속
+질문이면, 그 맥락을 채워 넣어 그 자체로 완전한 하나의 질문으로 다시
+쓰세요. 새 질문이 이미 완전하거나 이전 대화와 무관한 새로운 주제면
+새 질문을 그대로 반환하세요.
+
+<이전 대화>
+{history_text}
+</이전 대화>
+
+새 질문: {current}"""
+    result = structured_llm.invoke(prompt)
+    return {"resolved_question": result.standalone_question}
 
 
 def classify_query(state: State) -> dict:
@@ -198,7 +266,9 @@ def _document_node(state: State, *, is_fallback: bool) -> dict:
     # rewrite_document_query가 재작성한 검색어가 있으면 검색에만 쓰고,
     # 최종 답변은 항상 사용자의 원래 질문에 맞춰 생성한다.
     search_query = state.get("rewritten_query") if not is_fallback else None
-    result = get_rag_engine().answer(question, search_query=search_query)
+    result = get_rag_engine().answer(
+        question, search_query=search_query, my_timetable=state.get("my_timetable")
+    )
     insufficient = _is_insufficient(question, result["answer"], bool(result["pages"]))
 
     if is_fallback and insufficient and state.get("primary_result"):
@@ -217,6 +287,7 @@ def _document_node(state: State, *, is_fallback: bool) -> dict:
         "from_cache": False,
         "fallback_used": is_fallback,
         "insufficient": insufficient,
+        "courses": result.get("courses", []),
     }
     if not is_fallback:
         output["primary_result"] = dict(output)
@@ -237,6 +308,31 @@ def rewrite_document_query(state: State) -> dict:
         "rewritten_query": response.content.strip(),
         "retry_count": state.get("retry_count", 0) + 1,
     }
+
+
+def _courses_from_dataframe(df: pd.DataFrame | None) -> list[dict]:
+    """SQL 조회 결과가 과목 목록처럼 보이면(과목명+요일 컬럼이 있으면) "내
+    시간표에 담기" UI가 쓸 수 있는 구조로 변환한다. 질문마다 SELECT하는
+    컬럼이 달라서 학점/시작시간처럼 없는 컬럼도 있을 수 있어, 있는 것만
+    최대한 채운다."""
+    if df is None or df.empty or not {"과목명", "요일"}.issubset(df.columns):
+        return []
+    courses = []
+    for _, row in df.iterrows():
+        schedule = str(row["요일"])
+        if "시작시간" in df.columns and pd.notna(row["시작시간"]):
+            schedule += f" {row['시작시간']}"
+            if "종료시간" in df.columns and pd.notna(row["종료시간"]):
+                schedule += f"~{row['종료시간']}"
+        courses.append({
+            "과목코드": row["과목코드"] if "과목코드" in df.columns else row["과목명"],
+            "과목명": row["과목명"],
+            "학점": int(row["학점"]) if "학점" in df.columns and pd.notna(row["학점"]) else None,
+            "요일교시": schedule,
+            "학과": row["학과"] if "학과" in df.columns else None,
+            "출처": "강좌 DB",
+        })
+    return courses
 
 
 def _data_node(state: State, *, is_fallback: bool) -> dict:
@@ -282,6 +378,7 @@ def _data_node(state: State, *, is_fallback: bool) -> dict:
         "from_cache": outcome.get("from_cache", False),
         "fallback_used": is_fallback,
         "insufficient": not sufficient,
+        "courses": _courses_from_dataframe(outcome.get("dataframe")),
     }
     if not is_fallback:
         result_dict["retry_count"] = retry_count + 1

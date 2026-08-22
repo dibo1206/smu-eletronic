@@ -57,6 +57,97 @@ GYOYANG_PAGE_RANGE = (158, 172)
 COURSE_CODE_RE = re.compile(r"HB[A-Z]{2}\d{3,4}")
 GYOYANG_AREA_RE = re.compile(r"(기초|균형)\(([^)]*)\)")
 
+# 교양/전공 시간표 행 텍스트에 공통으로 나오는 "월2,3,4(I604)" 같은
+# 요일+교시 패턴. 시간 겹침 여부는 LLM의 자연어 추론에 맡기지 않고 이걸로
+# 직접 계산한다 — "월 2,3교시"와 "월 2,3,4교시"처럼 숫자가 여러 개 겹치는
+# 경우를 LLM이 텍스트만 보고 비교하다가 안 겹친다고 잘못 판단한 적이 있다.
+DAY_PERIODS_RE = re.compile(r"([월화수목금토일])((?:\d+,)*\d+)\(")
+
+
+def _extract_time_slots(text: str) -> set[tuple[str, int]]:
+    """텍스트에서 요일+교시 패턴을 모두 찾아 {(요일, 교시), ...} 집합으로
+    반환한다. 한 과목이 여러 요일에 열리면(분할 수업 등) 매치가 여러 번
+    나오는데 전부 합쳐서 반환한다."""
+    slots = set()
+    for day, periods in DAY_PERIODS_RE.findall(text):
+        for p in periods.split(","):
+            slots.add((day, int(p)))
+    return slots
+
+
+TIME_RANGE_RE = re.compile(r"([월화수목금토일])\s*(\d{1,2}):\d{2}(?:~(\d{1,2}):\d{2})?")
+# "요일교시" 필드는 우리가 직접 만든 문자열이라 "화6,7,8(I407)"처럼 강의실
+# 표시가 안 붙는다 — DAY_PERIODS_RE(뒤에 "(" 필요)와 달리 괄호 없이 매치한다.
+BARE_DAY_PERIODS_RE = re.compile(r"([월화수목금토일])((?:\d+,)*\d+)")
+
+
+def parse_schedule_to_slots(schedule: str) -> set[tuple[str, int]]:
+    """"내 시간표" 같은 UI에 저장된 "요일교시" 문자열에서 겹침 판단용
+    (요일, 교시) 집합을 뽑는다. 이 문자열은 출처에 따라 두 형식이
+    섞여있다 — RAG(PDF)에서 온 건 "화6,7,8"처럼 교시 번호, SQL(강좌 DB)
+    에서 온 건 "월 09:00" 또는 "월 09:00~12:00"처럼 실제 시각이라, 둘 다
+    처리한다."""
+    slots = set()
+    time_matches = list(TIME_RANGE_RE.finditer(schedule))
+    if time_matches:
+        for day, start_h, end_h in (m.groups() for m in time_matches):
+            start_period = int(start_h) - 8
+            end_period = int(end_h) - 8 - 1 if end_h else start_period
+            for p in range(start_period, max(end_period, start_period) + 1):
+                slots.add((day, p))
+        return slots
+    for day, periods in BARE_DAY_PERIODS_RE.findall(schedule):
+        for p in periods.split(","):
+            slots.add((day, int(p)))
+    return slots
+
+
+# 과목 행 텍스트는 "학점\n이론시간\n실습시간\n" 세 줄이 "균형(...)"/"기초(...)"
+# 또는 "요일+교시" 바로 앞에 온다(예: "3\n3\n0\n균형(인문)\n화6,7,8..."). 이
+# 숫자만 보고 LLM이 몇 번째 줄이 학점인지 헷갈려서(예: 2학점 과목을 3학점
+# 이라고 잘못 답한 적이 있다) 학점을 코드로 직접 뽑아서 명시적으로 알려준다.
+CREDIT_RE = re.compile(r"\n(\d+)\n\d+\n\d+\n(?:균형|기초|[월화수목금토일]\d)")
+
+
+def _extract_credit(text: str) -> Optional[int]:
+    """텍스트에서 학점 숫자를 뽑는다. 못 찾으면 None."""
+    m = CREDIT_RE.search(text)
+    return int(m.group(1)) if m else None
+
+
+def _extract_course_candidates(docs: List[Document]) -> list[dict]:
+    """검색된 시간표 문서(교양/개설학과별)에서 "내 시간표에 담기" UI가
+    쓸 수 있는 구조화된 과목 정보를 뽑는다. RAG 답변은 자유 텍스트라
+    Streamlit이 체크박스로 보여줄 방법이 없어서, 답변 생성과 별개로
+    같은 원문에서 코드로 직접 파싱해 리스트로 반환한다."""
+    seen_codes = set()
+    candidates = []
+    for doc in docs:
+        category = str(doc.metadata.get("category", ""))
+        if category != "개설학과별_시간표" and not category.startswith("교양_"):
+            continue
+        text = doc.page_content
+        code_match = COURSE_CODE_RE.search(text)
+        if not code_match or code_match.group() in seen_codes:
+            continue
+        seen_codes.add(code_match.group())
+
+        name = text[code_match.end():].split("\n", 1)[0].strip()
+        schedule = ", ".join(f"{day}{periods}" for day, periods in DAY_PERIODS_RE.findall(text))
+        if not schedule:
+            continue
+
+        candidates.append({
+            "과목코드": code_match.group(),
+            "과목명": name,
+            "학점": _extract_credit(text),
+            "요일교시": schedule,
+            "학과": doc.metadata.get("department"),
+            "출처": f"{doc.metadata.get('source', '?')} p.{doc.metadata.get('page', '?')}",
+        })
+    return candidates
+
+
 # 상명대 공과대학 학과별 시간표(통합본 143~157페이지, 11개 학과/전공)도
 # 페이지 통째가 아니라 과목 단위로 쪼갠다 — 안 그러면 "2학년만" 같은 질문에서
 # LLM이 뒤죽박죽인 원본 표 텍스트를 직접 읽고 학년을 스스로 걸러내야 해서
@@ -94,6 +185,21 @@ DEPARTMENT_NAMES = [
     "그린화학공학과", "건설시스템공학과", "정보보안공학과", "시스템반도체공학과",
     "휴먼지능로봇공학과", "지능형로봇학과", "AI모빌리티공학과",
 ]
+
+# 학생들이 정식 학과명 대신 쓰는 줄임말 — DEPARTMENT_NAMES(정식 학과명)와
+# 매핑해줘야 department 필터가 정확히 걸린다.
+DEPARTMENT_ALIASES = {
+    "휴먼지능로봇공학과": ["휴지로"],
+    "소프트웨어학과": ["솦웨"],
+    "시스템반도체공학과": ["시반공"],
+    "건설시스템공학과": ["건시공"],
+    "그린화학공학과": ["그화공"],
+    "경영공학과": ["경공"],
+    "스마트정보통신공학과": ["스정통"],
+}
+DEPARTMENT_ALIASES_TEXT = ", ".join(
+    f"{full}({'/'.join(aliases)})" for full, aliases in DEPARTMENT_ALIASES.items()
+)
 
 
 def _category_for_page(pdf_stem: str, page_num: int, page_text: str = "") -> Optional[str]:
@@ -232,6 +338,31 @@ PROMPT = PromptTemplate(
 주어진 정보를 바탕으로 사용자의 질문에 정확하고 친절하게 답변하세요.
 답변에 참고한 문서의 이름과 페이지 번호를 함께 밝히세요.
 
+<교시_시각_대응표>
+시간표 문서는 "월2,3,4"처럼 요일+교시로만 표기되어 있고 실제 시각은
+안 적혀 있습니다. 질문이 "9시", "오전 10시"처럼 실제 시각으로 물어보면
+아래 표로 교시와 대응시켜서 답하세요 (1교시당 1시간, N교시 = (8+N)시~(9+N)시):
+1교시=9~10시, 2교시=10~11시, 3교시=11~12시, 4교시=12~13시,
+5교시=13~14시, 6교시=14~15시, 7교시=15~16시, 8교시=16~17시,
+9교시=17~18시, 10교시=18~19시, 11교시=19~20시, 12교시=20~21시,
+13교시=21~22시, 14교시=22~23시, 15교시=23~24시.
+예: "월2,3,4"는 월요일 10시~13시 수업입니다. 이 대응표를 벗어나는
+교시(16교시 이상, 8시 이전)는 문서에 없는 시간대이니 추측하지 마세요.
+</교시_시각_대응표>
+
+각 문서 앞에 "[학점: N]"이 붙어 있으면 그 과목의 학점은 반드시 그 숫자를
+쓰세요. 본문에 있는 "3\n3\n0"처럼 줄바꿈된 숫자들을 직접 세어 학점을
+추측하지 마세요 — 이론/실습 시간과 헷갈려서 틀리기 쉽습니다.
+
+<겹침_판단_주의>
+전공 시간표나 "사용자가 이미 담아둔 내 시간표"와 겹치는지 스스로 다시
+계산하지 마세요 — 여러 요일/교시가 섞인 문서에서 숫자를 눈으로 비교하다
+안 겹치는데 겹친다고(또는 그 반대로) 틀리기 쉽습니다. 컨텍스트에 있는
+교양 후보 목록은 이미 코드로 겹침 계산을 끝내고 걸러진 것이므로, 그
+목록에 있는 과목은 겹치지 않는다고 그대로 신뢰해서 답하세요. "[참고: ...
+겹칩니다]"라는 문구가 명시적으로 있을 때만 겹친다고 판단하세요.
+</겹침_판단_주의>
+
 질문이 여러 요청을 한 번에 담고 있어서 그 중 일부만 아래 정보로 답할 수
 있다면, 답할 수 있는 부분만 답하고 나머지는 "이 답변에서는 OOO 정보는
 확인하지 못했습니다. OOO만 따로 다시 물어봐 주세요"처럼 어떤 부분이
@@ -327,9 +458,10 @@ class ParentDocumentRetriever:
         page_range: Optional[tuple[int, int]] = None,
         grade: Optional[int] = None,
         department: Optional[str] = None,
+        k: Optional[int] = None,
     ) -> List[Document]:
         child_results = self.get_child_chunks(
-            query, categories=categories, page_range=page_range, grade=grade, department=department
+            query, categories=categories, page_range=page_range, grade=grade, department=department, k=k
         )
 
         parent_ids = []
@@ -527,6 +659,12 @@ class RagEngine:
 {department_list}
 </engineering_departments>
 
+<department_aliases>
+학생들이 정식 학과명 대신 줄임말을 쓰기도 합니다: {DEPARTMENT_ALIASES_TEXT}.
+질문에 줄임말이 나오면 department에는 반드시 정식 학과명(위 목록에 있는
+이름 그대로)을 넣으세요.
+</department_aliases>
+
 <question>
 {question}
 </question>
@@ -559,11 +697,20 @@ class RagEngine:
         department = result.department if result.department in DEPARTMENT_NAMES else None
         return (valid or None), result.grade, department
 
-    def answer(self, question: str, search_query: Optional[str] = None) -> dict:
+    def answer(
+        self,
+        question: str,
+        search_query: Optional[str] = None,
+        my_timetable: Optional[list[dict]] = None,
+    ) -> dict:
         """search_query를 따로 주면 검색(카테고리 판단·벡터 검색)에는 그걸 쓰고,
         답변 생성에는 원래 question을 쓴다 — rewrite_query로 검색어만
         재작성했을 때 최종 답변이 재작성된 문장이 아니라 사용자의 원래
-        질문에 답하도록 하기 위해서다."""
+        질문에 답하도록 하기 위해서다.
+
+        my_timetable: Streamlit "내 시간표"에 담아둔 과목 목록. "담은 과목과
+        안 겹치게 추천해줘"처럼 전공 시간표가 아니라 사용자가 이미 골라둔
+        과목 기준으로 겹침을 피해야 하는 질문에 쓴다."""
         query_for_search = search_query or question
         categories, grade, department = self.determine_category(query_for_search)
         retrieved = self.retriever.invoke(
@@ -588,11 +735,87 @@ class RagEngine:
                     retrieved.append(doc)
                     existing_ids.add(doc.metadata.get("parent_id"))
 
-        context_parts = [
-            f"[{doc.metadata.get('source', '?')} - 페이지 {doc.metadata.get('page', '?')}]\n{doc.page_content}"
-            for doc in retrieved
-        ]
+        # "전공 시간표 피해서 교양 추천해줘"처럼 전공 시간표와 교양을 함께
+        # 찾는 질문은, 실제로 PDF에 있는 교양 과목 중 "겹치지 않는 걸 찾아야"
+        # 하는데 공유 k=5로는 교양 후보가 1~2개만 뽑혀서 정말로 존재하는
+        # 다른 후보들을 못 보고 "없다"고 오판할 수 있다(실제로 PDF엔 더
+        # 있는데 검색에 안 걸린 경우). 이 조합일 때는 교양 카테고리만 훨씬
+        # 넉넉하게(k=30) 한 번 더 가져와서 후보 풀을 넓힌다.
+        gyoyang_categories = [c for c in (categories or []) if c.startswith("교양_")]
+        wants_conflict_check = ("개설학과별_시간표" in (categories or [])) or bool(my_timetable)
+        if gyoyang_categories and wants_conflict_check:
+            broader_gyoyang_docs = self.retriever.invoke(
+                query_for_search, categories=gyoyang_categories, k=30
+            )
+            existing_ids = {d.metadata.get("parent_id") for d in retrieved}
+            for doc in broader_gyoyang_docs:
+                if doc.metadata.get("parent_id") not in existing_ids:
+                    retrieved.append(doc)
+                    existing_ids.add(doc.metadata.get("parent_id"))
+
+        # "전공 시간표 피해서 교양 추천해줘" 같은 질문은 교양 후보와 전공
+        # 시간표가 겹치는지를 LLM이 텍스트 보고 스스로 판단하게 두면 틀리기
+        # 쉽다("월2,3"과 "월2,3,4"가 겹치는데 안 겹친다고 결론 낸 사례가
+        # 있었다). grade/department가 정해져 있어 정확히 "이 학생의 전공
+        # 시간표"를 알 수 있을 때는, 겹치는 교시를 코드로 직접 계산해서
+        # 겹치는 교양 후보는 아예 컨텍스트에서 빼버린다.
+        def _is_dept_timetable(doc: Document) -> bool:
+            return doc.metadata.get("category") == "개설학과별_시간표"
+
+        def _is_gyoyang(doc: Document) -> bool:
+            return str(doc.metadata.get("category", "")).startswith("교양_")
+
+        dept_docs = [d for d in retrieved if _is_dept_timetable(d)]
+        gyoyang_docs = [d for d in retrieved if _is_gyoyang(d)]
+        other_docs = [d for d in retrieved if not _is_dept_timetable(d) and not _is_gyoyang(d)]
+
+        conflict_note = None
+        occupied = set()
+        if grade and department:
+            for d in dept_docs:
+                occupied |= _extract_time_slots(d.page_content)
+        conflict_source = "위 전공 시간표"
+        if my_timetable:
+            timetable_slots = set()
+            for course in my_timetable:
+                timetable_slots |= parse_schedule_to_slots(course.get("요일교시", ""))
+            if timetable_slots:
+                occupied |= timetable_slots
+                conflict_source = "이미 담아둔 내 시간표" if not (grade and department) else "전공 시간표/내 시간표"
+
+        if occupied and gyoyang_docs:
+            free_gyoyang = [d for d in gyoyang_docs if not (_extract_time_slots(d.page_content) & occupied)]
+            if free_gyoyang:
+                gyoyang_docs = free_gyoyang
+            else:
+                # 후보 전부 겹치는 드문 경우 — 걸러내면 후보가 하나도 안
+                # 남으므로, 그대로 두되 전부 겹친다는 사실을 프롬프트에
+                # 명시해서 LLM이 "안 겹친다"고 오판하지 않게 한다.
+                conflict_note = (
+                    f"아래 교양 후보 과목은 모두 {conflict_source}와 요일·교시가 "
+                    "겹칩니다. 겹치지 않는 대안을 찾지 못했다고 답변하세요."
+                )
+            retrieved = dept_docs + gyoyang_docs + other_docs
+
+        def _format_doc(doc: Document) -> str:
+            header = f"[{doc.metadata.get('source', '?')} - 페이지 {doc.metadata.get('page', '?')}]"
+            credit = _extract_credit(doc.page_content)
+            if credit is not None:
+                header += f" [학점: {credit}]"
+            return f"{header}\n{doc.page_content}"
+
+        context_parts = [_format_doc(doc) for doc in retrieved]
         context = "\n\n---\n\n".join(context_parts) if context_parts else "(관련 문서를 찾지 못했습니다)"
+        if conflict_note:
+            context += f"\n\n---\n\n[참고: {conflict_note}]"
+        if my_timetable:
+            # 겹치는 후보를 코드로 이미 걸러냈어도, "담은 과목이 뭔지 몰라서
+            # 답 못하겠다"고 하지 않도록 실제 담긴 과목 목록을 컨텍스트에
+            # 명시한다.
+            timetable_text = ", ".join(
+                f"{c['과목명']}({c.get('요일교시', '?')})" for c in my_timetable
+            )
+            context += f"\n\n---\n\n[사용자가 이미 담아둔 내 시간표: {timetable_text}]"
 
         formatted_prompt = PROMPT.format(context=context, question=question)
         response = self.llm.invoke(formatted_prompt)
@@ -604,6 +827,7 @@ class RagEngine:
                 f"{doc.metadata.get('source', '?')} p.{doc.metadata.get('page', '?')}"
                 for doc in retrieved
             ],
+            "courses": _extract_course_candidates(retrieved),
         }
 
 

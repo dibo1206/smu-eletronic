@@ -12,7 +12,7 @@ from pathlib import Path
 # "ai.nodes" 같은 절대 임포트가 되도록 src/를 sys.path에 직접 넣어준다.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AnyMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
 
 from ai.nodes import (
@@ -22,6 +22,7 @@ from ai.nodes import (
     data_fallback,
     document_fallback,
     general_answer,
+    resolve_question,
     rewrite_document_query,
     route_after_data,
     route_after_document,
@@ -29,10 +30,15 @@ from ai.nodes import (
 )
 from ai.state import State
 
+# ask()에 넘길 이전 대화는 최근 이만큼(3턴)만 잘라 쓴다 — 오래된 맥락까지
+# 전부 프롬프트에 넣을 필요는 없고, resolve_question 호출 비용도 줄인다.
+MAX_HISTORY_MESSAGES = 6
+
 
 def build_graph():
     builder = StateGraph(State)
 
+    builder.add_node("resolve_question", resolve_question)
     builder.add_node("classify_query", classify_query)
     builder.add_node("general", general_answer)
     builder.add_node("document", answer_from_document)
@@ -41,7 +47,8 @@ def build_graph():
     builder.add_node("document_fallback", document_fallback)
     builder.add_node("data_fallback", data_fallback)
 
-    builder.add_edge(START, "classify_query")
+    builder.add_edge(START, "resolve_question")
+    builder.add_edge("resolve_question", "classify_query")
     builder.add_conditional_edges(
         "classify_query",
         route_by_query_type,
@@ -83,11 +90,27 @@ def get_graph():
     return _graph
 
 
-def ask(question: str) -> dict:
-    """질문 하나를 그래프에 태워 답변/근거를 반환한다."""
+def ask(
+    question: str,
+    history: list[AnyMessage] | None = None,
+    my_timetable: list[dict] | None = None,
+) -> dict:
+    """질문 하나를 그래프에 태워 답변/근거를 반환한다.
+
+    history: 이전 턴들의 메시지(HumanMessage/AIMessage 번갈아). 넘겨주면
+    resolve_question 노드가 "2학년 전공과목"처럼 주어가 생략된 후속
+    질문을 이전 맥락으로 채워서 다시 쓴다. 넘기지 않으면(기본값) 매번
+    새 대화로 취급한다.
+
+    my_timetable: Streamlit "내 시간표"에 담아둔 과목 목록. "담은 과목과
+    안 겹치게 추천해줘"처럼 물으면 document 노드가 이 목록과 겹치는
+    교양 후보를 걸러내는 데 쓴다."""
+    messages = list(history[-MAX_HISTORY_MESSAGES:]) if history else []
+    messages.append(HumanMessage(content=question))
+
     result = get_graph().invoke(
         {
-            "messages": [HumanMessage(content=question)],
+            "messages": messages,
             "query_type": "",
             "sql": "",
             "pages": [],
@@ -99,6 +122,9 @@ def ask(question: str) -> dict:
             "retry_count": 0,
             "rewritten_query": None,
             "primary_result": None,
+            "resolved_question": None,
+            "courses": [],
+            "my_timetable": my_timetable,
         }
     )
     return {
@@ -110,6 +136,7 @@ def ask(question: str) -> dict:
         "dataframe": result.get("dataframe"),
         "from_cache": result.get("from_cache", False),
         "fallback_used": result.get("fallback_used", False),
+        "courses": result.get("courses", []),
     }
 
 

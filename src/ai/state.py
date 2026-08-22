@@ -24,3 +24,6 @@ class State(TypedDict):
     retry_count: int
     rewritten_query: Optional[str]
     primary_result: Optional[dict]
+    resolved_question: Optional[str]
+    courses: list
+    my_timetable: Optional[list]
